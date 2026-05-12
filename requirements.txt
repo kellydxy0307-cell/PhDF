@@ -1,0 +1,6 @@
+# The app can run with the current Windows Python environment used during development.
+# Optional but recommended:
+requests>=2.25
+pywin32>=300
+pypdf>=4.0
+reportlab>=4.0
