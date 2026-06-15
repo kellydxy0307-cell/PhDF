@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+
+# Local settings / runtime output
+summary.pdf
+summary_*.pdf
+
+# Debug and preview artifacts
+_preview/
+_tmp_ui_debug/
+_tmp_ui_debug2/
+_tmp_ui_debug3/
+_tmp_ui_debug4/
+tmp_ui_debug4/
+summary_name_test/
+
+# Windows shell noise
+Thumbs.db
+Desktop.ini
+
+# Packaging / local experiments
+dist/
+build/
+*.spec

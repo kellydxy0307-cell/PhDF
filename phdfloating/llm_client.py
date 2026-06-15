@@ -22,14 +22,18 @@ class OpenAICompatibleLLMClient:
         self.model = llm["model"]
         self.temperature = float(llm["temperature"])
         self.timeout_seconds = max(5, int(llm["requestTimeoutMs"]) / 1000)
+        self.summary_language = llm["summaryLanguage"]
 
-    def summarize_input_json_list(self, input_json_list: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+    def summarize_input_json_list(self, input_json_list: Sequence[Dict[str, str]]) -> List[Dict[str, Any]]:
         """Summarize PDFs one by one and return a merged JSON list."""
 
-        results: List[Dict[str, str]] = []
+        results: List[Dict[str, Any]] = []
         for item in input_json_list:
             file_name = str(item.get("file_name") or "未命名 PDF")
-            completion = self.request_chat_completion(build_messages([item]), max_tokens=900)
+            completion = self.request_chat_completion(
+                build_messages([item], summary_language=self.summary_language),
+                max_tokens=900,
+            )
             parsed = parse_summary_json(completion)
 
             if parsed:
@@ -38,7 +42,7 @@ class OpenAICompatibleLLMClient:
                     result["name"] = file_name
                 results.append(result)
             else:
-                results.append({"name": file_name, "summary": "模型没有返回可读总结。"})
+                results.append({"name": file_name, "summary": "模型没有返回可读总结。", "keywords": []})
 
         return results
 

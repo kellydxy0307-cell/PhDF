@@ -16,39 +16,47 @@ def get_selected_pdf_paths() -> List[str]:
     """
 
     try:
+        import pythoncom  # type: ignore
         import win32com.client  # type: ignore
         import win32gui  # type: ignore
     except Exception:
         return []
 
-    shell = win32com.client.Dispatch("Shell.Application")
-    foreground_hwnd = 0
+    pythoncom.CoInitialize()
     try:
-        foreground_hwnd = int(win32gui.GetForegroundWindow())
-    except Exception:
+        shell = win32com.client.Dispatch("Shell.Application")
         foreground_hwnd = 0
-
-    explorer_windows = _iter_explorer_windows(shell)
-    foreground_matches: List[str] = []
-    fallback_matches: List[str] = []
-
-    for window in explorer_windows:
-        selected = _selected_paths_from_window(window)
-        if not selected:
-            continue
-
-        pdfs = _filter_pdf_paths(selected)
-        if not pdfs:
-            continue
-
-        fallback_matches.extend(pdfs)
         try:
-            if int(window.HWND) == foreground_hwnd:
-                foreground_matches.extend(pdfs)
+            foreground_hwnd = int(win32gui.GetForegroundWindow())
         except Exception:
-            continue
+            foreground_hwnd = 0
 
-    return _dedupe_paths(foreground_matches or fallback_matches)
+        explorer_windows = _iter_explorer_windows(shell)
+        foreground_matches: List[str] = []
+        fallback_matches: List[str] = []
+
+        for window in explorer_windows:
+            selected = _selected_paths_from_window(window)
+            if not selected:
+                continue
+
+            pdfs = _filter_pdf_paths(selected)
+            if not pdfs:
+                continue
+
+            fallback_matches.extend(pdfs)
+            try:
+                if int(window.HWND) == foreground_hwnd:
+                    foreground_matches.extend(pdfs)
+            except Exception:
+                continue
+
+        return _dedupe_paths(foreground_matches or fallback_matches)
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
 
 
 def _iter_explorer_windows(shell: object) -> Iterable[object]:
