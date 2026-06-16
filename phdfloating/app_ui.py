@@ -843,6 +843,7 @@ class FloatingSummaryApp:
         normalized = name.replace("\\", "/")
         return (
             normalized.endswith("_60.png")
+            or normalized.endswith("expanded_loading_bg.png")
             or normalized.endswith("000010.png")
             or normalized.endswith("expanded_combined_1_2x.png")
         )

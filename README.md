@@ -12,7 +12,7 @@ The app keeps PDF parsing local, sends only extracted text to an OpenAI-compatib
 
 - Draggable desktop floating ball
 - Double-click to expand or collapse
-- Batch process up to 5 selected PDFs at once
+- Batch process up to 15 selected PDFs at once
 - Supports both text PDFs and image/scanned PDFs
 - Local API configuration UI
 - Output summary PDF with title, summary, and keywords
@@ -86,7 +86,7 @@ python -m phdfloating.main
 5. Click the floating ball document button.
 6. The app extracts text locally, calls the configured model, and writes the result to the Downloads folder.
 
-If more than 5 PDFs are selected, only the first 5 are processed and the app shows a warning.
+If more than 15 PDFs are selected, only the first 15 are processed and the app shows a warning.
 
 ## Output
 

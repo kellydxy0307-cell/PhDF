@@ -25,14 +25,18 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "summaryLanguage": "zh-CN",
     },
     "limits": {
-        "maxPdfFiles": 5,
-        "maxCharsPerPdf": 60000,
+        "maxPdfFiles": 15,
+        "maxCharsPerPdf": 50000,
     },
 }
 
 SUMMARY_LANGUAGE_OPTIONS = {"zh-CN", "en"}
 
 API_KEY_ENCRYPTED_FIELD = "apiKeyEncrypted"
+LEGACY_LIMIT_DEFAULTS = {
+    "maxPdfFiles": 5,
+    "maxCharsPerPdf": 60000,
+}
 
 
 class _DataBlob(ctypes.Structure):
@@ -148,6 +152,7 @@ def _prepare_settings_for_disk(settings: Dict[str, Any]) -> Dict[str, Any]:
 def _inflate_settings_from_disk(raw_settings: Dict[str, Any]) -> Dict[str, Any]:
     inflated = copy.deepcopy(raw_settings or {})
     llm = inflated.setdefault("llm", {})
+    limits = inflated.setdefault("limits", {})
     encrypted_value = str(llm.get(API_KEY_ENCRYPTED_FIELD) or "").strip()
     plaintext_value = str(llm.get("apiKey") or "").strip()
     if encrypted_value:
@@ -158,6 +163,21 @@ def _inflate_settings_from_disk(raw_settings: Dict[str, Any]) -> Dict[str, Any]:
     else:
         llm["apiKey"] = plaintext_value
     llm.pop(API_KEY_ENCRYPTED_FIELD, None)
+
+    # Migrate legacy persisted defaults to the newer release limits.
+    # These values were previously not user-editable in the UI, so persisted
+    # 5 / 60000 should be treated as old defaults rather than user intent.
+    try:
+        if int(limits.get("maxPdfFiles")) == LEGACY_LIMIT_DEFAULTS["maxPdfFiles"]:
+            limits["maxPdfFiles"] = DEFAULT_SETTINGS["limits"]["maxPdfFiles"]
+    except (TypeError, ValueError):
+        pass
+    try:
+        if int(limits.get("maxCharsPerPdf")) == LEGACY_LIMIT_DEFAULTS["maxCharsPerPdf"]:
+            limits["maxCharsPerPdf"] = DEFAULT_SETTINGS["limits"]["maxCharsPerPdf"]
+    except (TypeError, ValueError):
+        pass
+
     return inflated
 
 
@@ -219,7 +239,7 @@ def sanitize_settings(raw_settings: Dict[str, Any]) -> Dict[str, Any]:
                 clamp_number(
                     limits.get("maxPdfFiles"),
                     1,
-                    5,
+                    15,
                     DEFAULT_SETTINGS["limits"]["maxPdfFiles"],
                 )
             ),
@@ -245,9 +265,14 @@ def load_settings() -> Dict[str, Any]:
             raw_settings = json.load(file)
             sanitized = sanitize_settings(raw_settings)
             llm = (raw_settings or {}).get("llm") or {}
+            raw_limits = (raw_settings or {}).get("limits") or {}
             has_plaintext_key = bool(str(llm.get("apiKey") or "").strip())
             has_encrypted_key = bool(str(llm.get(API_KEY_ENCRYPTED_FIELD) or "").strip())
-            if has_plaintext_key or (has_encrypted_key and llm.get("apiKey")):
+            legacy_limits_detected = (
+                str(raw_limits.get("maxPdfFiles") or "").strip() == str(LEGACY_LIMIT_DEFAULTS["maxPdfFiles"])
+                or str(raw_limits.get("maxCharsPerPdf") or "").strip() == str(LEGACY_LIMIT_DEFAULTS["maxCharsPerPdf"])
+            )
+            if has_plaintext_key or (has_encrypted_key and llm.get("apiKey")) or legacy_limits_detected:
                 try:
                     save_settings(sanitized)
                 except OSError:

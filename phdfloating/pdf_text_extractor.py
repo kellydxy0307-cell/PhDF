@@ -13,6 +13,7 @@ LLM-ready text as quickly as possible while staying entirely local.
 from __future__ import annotations
 
 import concurrent.futures
+from collections import Counter
 import importlib.util
 import json
 import math
@@ -27,12 +28,25 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
 
-DEFAULT_MAX_PDF_FILES = 5
-DEFAULT_MAX_CHARS_PER_PDF = 60000
+DEFAULT_MAX_PDF_FILES = 15
+DEFAULT_MAX_CHARS_PER_PDF = 50000
 DEFAULT_MAX_OCR_PAGES = 120
 DEFAULT_OCR_RENDER_WIDTH = 1400
 DEFAULT_OCR_TIMEOUT_SECONDS = 360
 CPU_UTILIZATION_LIMIT = 0.8
+
+TRAILING_SECTION_HEADERS = (
+    "references",
+    "bibliography",
+    "acknowledgements",
+    "acknowledgments",
+    "appendix",
+    "appendices",
+    "supplementary material",
+    "supplementary materials",
+    "supplementary information",
+    "supporting information",
+)
 
 
 class PdfExtractionError(RuntimeError):
@@ -390,7 +404,12 @@ def _normalize_pdf_paths(file_paths: Sequence[str]) -> List[str]:
 
 
 def _finalize_text(value: str) -> str:
-    return _normalize_text(value)
+    text = _normalize_text(value)
+    text = _strip_repetitive_noise_lines(text)
+    text = _strip_inline_noise_lines(text)
+    text = _trim_trailing_reference_like_sections(text)
+    text = _normalize_text(text)
+    return text
 
 
 def _normalize_text(value: str) -> str:
@@ -403,6 +422,117 @@ def _normalize_text(value: str) -> str:
     text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n{4,}", "\n\n\n", text)
     return text.strip()
+
+
+def _strip_repetitive_noise_lines(value: str) -> str:
+    lines = value.splitlines()
+    normalized_counts: Counter[str] = Counter()
+
+    for line in lines:
+        key = _noise_count_key(line)
+        if key:
+            normalized_counts[key] += 1
+
+    cleaned_lines: List[str] = []
+    for line in lines:
+        key = _noise_count_key(line)
+        if key and normalized_counts[key] >= 3:
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines)
+
+
+def _noise_count_key(line: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(line or "")).strip()
+    if not cleaned:
+        return ""
+    if len(cleaned) > 140:
+        return ""
+    lowered = cleaned.lower()
+    if _is_probable_page_number(cleaned):
+        return "__page_number__"
+    if any(token in lowered for token in ("doi", "copyright", "all rights reserved", "downloaded from")):
+        return lowered
+    if re.search(r"\b(vol\.?|volume|issue|journal|issn|www\.)\b", lowered):
+        return lowered
+    return ""
+
+
+def _strip_inline_noise_lines(value: str) -> str:
+    cleaned_lines: List[str] = []
+    for line in value.splitlines():
+        stripped = line.strip()
+        lowered = stripped.lower()
+        if not stripped:
+            cleaned_lines.append("")
+            continue
+        if _is_probable_page_number(stripped):
+            continue
+        if lowered.startswith("doi:") or lowered.startswith("https://doi.org/") or lowered.startswith("http://doi.org/"):
+            continue
+        if "all rights reserved" in lowered:
+            continue
+        if "downloaded from" in lowered and len(stripped) < 180:
+            continue
+        if re.match(r"^copyright\b", lowered):
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines)
+
+
+def _trim_trailing_reference_like_sections(value: str) -> str:
+    lines = value.splitlines()
+    cutoff_index: Optional[int] = None
+    min_index = _minimum_trailing_cut_index(lines)
+
+    for index, line in enumerate(lines):
+        if index < min_index:
+            continue
+        if _is_trailing_section_header(line):
+            cutoff_index = index
+            break
+
+    if cutoff_index is None:
+        return value
+    return "\n".join(lines[:cutoff_index]).rstrip()
+
+
+def _minimum_trailing_cut_index(lines: Sequence[str]) -> int:
+    line_count = len(lines)
+    if line_count <= 8:
+        return max(3, line_count - 4)
+    if line_count <= 20:
+        return max(5, int(line_count * 0.5))
+    return max(12, int(line_count * 0.35))
+
+
+def _is_trailing_section_header(line: str) -> bool:
+    normalized = re.sub(r"^[\s\d.IVXivx\-:()]+", "", str(line or "")).strip()
+    normalized = re.sub(r"\s+", " ", normalized)
+    if not normalized or len(normalized) > 80:
+        return False
+
+    lowered = normalized.lower().rstrip(":.")
+    if lowered in TRAILING_SECTION_HEADERS:
+        return True
+
+    for header in TRAILING_SECTION_HEADERS:
+        if lowered == f"{header}s":
+            return True
+        if lowered.startswith(f"{header} "):
+            return True
+    return False
+
+
+def _is_probable_page_number(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text or len(text) > 24:
+        return False
+    if re.fullmatch(r"(page\s+)?\d+(\s*(/|of)\s*\d+)?", text, flags=re.IGNORECASE):
+        return True
+    if len(text) >= 2 and re.fullmatch(r"[ivxlcdm]+", text, flags=re.IGNORECASE):
+        return True
+    return False
 
 
 def _limit_text(value: str, max_chars: int) -> str:
