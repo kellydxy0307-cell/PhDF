@@ -14,8 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageTk
 
-from .llm_client import OpenAICompatibleLLMClient
-from .pdf_text_extractor import build_input_json_list
+from .pdf_text_extractor import prepare_pdf_batch
 from .settings_store import (
     DEFAULT_SETTINGS,
     ensure_api_settings,
@@ -24,7 +23,7 @@ from .settings_store import (
     save_settings,
     sanitize_settings,
 )
-from .summary_pdf_writer import write_summary_pdf
+from .summary_pipeline import run_summary_pipeline
 from .windows_selection import get_selected_pdf_paths
 
 
@@ -333,31 +332,25 @@ class FloatingSummaryApp:
         self._start_loading_animation()
         self._redraw()
 
-        try:
-            extraction = build_input_json_list(
-                selected_pdfs,
-                max_files=settings["limits"]["maxPdfFiles"],
-                max_chars_per_pdf=settings["limits"]["maxCharsPerPdf"],
-            )
-        except Exception as error:
-            self._reset_loading_state()
-            messagebox.showerror("PDF 读取失败", str(error))
-            return
+        batch = prepare_pdf_batch(
+            selected_pdfs,
+            max_files=settings["limits"]["maxPdfFiles"],
+        )
 
-        if not extraction.input_json_list:
+        if not batch.accepted_paths:
             self._reset_loading_state()
             messagebox.showwarning("未找到 PDF", "当前选择中没有可处理的 PDF 文件。")
             return
 
-        if extraction.truncated:
+        if batch.truncated:
             messagebox.showwarning(
                 "PDF 数量超过限制",
-                f"检测到 {len(selected_pdfs)} 份 PDF，本次只处理前 {len(extraction.accepted_paths)} 份。",
+                f"检测到 {len(selected_pdfs)} 份 PDF，本次只处理前 {len(batch.accepted_paths)} 份。",
             )
 
         worker = threading.Thread(
             target=self._summary_worker,
-            args=(settings, extraction.input_json_list, extraction.errors),
+            args=(settings, batch.accepted_paths, settings["limits"]["maxCharsPerPdf"]),
             daemon=True,
         )
         worker.start()
@@ -406,17 +399,16 @@ class FloatingSummaryApp:
     def _summary_worker(
         self,
         settings: Dict[str, Any],
-        input_json_list: List[Dict[str, str]],
-        extraction_errors: List[str],
+        accepted_paths: List[str],
+        max_chars_per_pdf: int,
     ) -> None:
         try:
-            client = OpenAICompatibleLLMClient(settings)
-            summaries = client.summarize_input_json_list(input_json_list)
-            output_path = write_summary_pdf(
-                summaries,
-                summary_language=settings["llm"]["summaryLanguage"],
+            pipeline_result = run_summary_pipeline(
+                settings,
+                accepted_paths,
+                max_chars_per_pdf=max_chars_per_pdf,
             )
-            self.result_queue.put(("success", (output_path, extraction_errors)))
+            self.result_queue.put(("success", (pipeline_result.output_path, pipeline_result.warnings)))
         except Exception as error:
             self.result_queue.put(("error", str(error)))
 
@@ -426,10 +418,10 @@ class FloatingSummaryApp:
                 status, payload = self.result_queue.get_nowait()
                 self._reset_loading_state()
                 if status == "success":
-                    output_path, extraction_errors = payload
+                    output_path, warnings = payload
                     message = f"总结完成，已输出：\n{output_path}"
-                    if extraction_errors:
-                        message += "\n\n部分 PDF 文本提取有警告：\n" + "\n".join(extraction_errors[:3])
+                    if warnings:
+                        message += "\n\n部分 PDF 处理有警告：\n" + "\n".join(warnings[:3])
                     messagebox.showinfo("完成", message)
                 else:
                     messagebox.showerror("总结失败", str(payload))

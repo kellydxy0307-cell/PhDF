@@ -22,10 +22,11 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 
 DEFAULT_MAX_PDF_FILES = 15
@@ -54,6 +55,32 @@ class PdfExtractionError(RuntimeError):
 
 
 @dataclass
+class PreparedPdfBatch:
+    accepted_paths: List[str]
+    ignored_paths: List[str]
+
+    @property
+    def truncated(self) -> bool:
+        return bool(self.ignored_paths)
+
+
+@dataclass
+class ExtractedPdfPayload:
+    index: int
+    path: str
+    file_name: str
+    pdf_content: str
+    extraction_error: str = ""
+    elapsed_seconds: float = 0.0
+
+    def to_input_item(self) -> Dict[str, str]:
+        return {
+            "file_name": self.file_name,
+            "pdf_content": self.pdf_content,
+        }
+
+
+@dataclass
 class ExtractionResult:
     input_json_list: List[Dict[str, str]]
     accepted_paths: List[str]
@@ -76,6 +103,17 @@ class EngineResult:
 _MODULE_CACHE: Dict[str, bool] = {}
 
 
+def prepare_pdf_batch(
+    file_paths: Sequence[str],
+    max_files: int = DEFAULT_MAX_PDF_FILES,
+) -> PreparedPdfBatch:
+    pdf_paths = _normalize_pdf_paths(file_paths)
+    return PreparedPdfBatch(
+        accepted_paths=pdf_paths[:max_files],
+        ignored_paths=pdf_paths[max_files:],
+    )
+
+
 def build_input_json_list(
     file_paths: Sequence[str],
     max_files: int = DEFAULT_MAX_PDF_FILES,
@@ -83,9 +121,9 @@ def build_input_json_list(
 ) -> ExtractionResult:
     """Extract text from up to ``max_files`` PDFs and return LLM-ready JSON."""
 
-    pdf_paths = _normalize_pdf_paths(file_paths)
-    accepted_paths = pdf_paths[:max_files]
-    ignored_paths = pdf_paths[max_files:]
+    batch = prepare_pdf_batch(file_paths, max_files=max_files)
+    accepted_paths = batch.accepted_paths
+    ignored_paths = batch.ignored_paths
 
     if not accepted_paths:
         return ExtractionResult(
@@ -96,23 +134,22 @@ def build_input_json_list(
         )
 
     workers = _compute_file_worker_limit(len(accepted_paths))
-    ordered_results = _extract_files_parallel(accepted_paths, max_chars_per_pdf, workers)
+    ordered_results = _collect_extracted_pdf_payloads(accepted_paths, max_chars_per_pdf, workers)
 
     input_json_list: List[Dict[str, str]] = []
     errors: List[str] = []
 
-    for result in ordered_results:
-        file_name = Path(result["path"]).name
-        if result["error"]:
-            errors.append(f"{file_name}: {result['error']}")
-            text = f"Unable to extract readable text from this PDF. Reason: {result['error']}"
+    for payload in ordered_results:
+        if payload.extraction_error:
+            errors.append(f"{payload.file_name}: {payload.extraction_error}")
+            text = f"Unable to extract readable text from this PDF. Reason: {payload.extraction_error}"
         else:
-            text = result["text"]
+            text = payload.pdf_content
 
         input_json_list.append(
             {
-                "file_name": file_name,
-                "pdf_content": _limit_text(_normalize_text(text), max_chars_per_pdf),
+                "file_name": payload.file_name,
+                "pdf_content": text if not payload.extraction_error else _limit_text(_normalize_text(text), max_chars_per_pdf),
             }
         )
 
@@ -164,47 +201,154 @@ def extract_pdf_text(file_path: str, max_chars: int = DEFAULT_MAX_CHARS_PER_PDF)
     )
 
 
-def _extract_files_parallel(
+def stream_extracted_pdf_payloads(
+    accepted_paths: Sequence[str],
+    max_chars_per_pdf: int = DEFAULT_MAX_CHARS_PER_PDF,
+    workers: Optional[int] = None,
+    event_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+) -> Iterator[ExtractedPdfPayload]:
+    paths = list(accepted_paths or [])
+    if not paths:
+        return
+
+    worker_limit = workers if workers is not None else _compute_file_worker_limit(len(paths))
+    yield from _stream_extracted_pdf_payloads_parallel(
+        paths,
+        max_chars_per_pdf,
+        worker_limit,
+        event_callback=event_callback,
+    )
+
+
+def _collect_extracted_pdf_payloads(
     accepted_paths: Sequence[str],
     max_chars_per_pdf: int,
     workers: int,
-) -> List[Dict[str, str]]:
-    if len(accepted_paths) == 1 or workers <= 1:
-        return [
-            _extract_single_payload(index, path, max_chars_per_pdf)
-            for index, path in enumerate(accepted_paths)
-        ]
+) -> List[ExtractedPdfPayload]:
+    ordered = list(
+        stream_extracted_pdf_payloads(
+            accepted_paths,
+            max_chars_per_pdf=max_chars_per_pdf,
+            workers=workers,
+        )
+    )
+    ordered.sort(key=lambda item: item.index)
+    return ordered
 
-    ordered: List[Optional[Dict[str, str]]] = [None] * len(accepted_paths)
+
+def _stream_extracted_pdf_payloads_parallel(
+    accepted_paths: Sequence[str],
+    max_chars_per_pdf: int,
+    workers: int,
+    event_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+) -> Iterator[ExtractedPdfPayload]:
+    if len(accepted_paths) == 1 or workers <= 1:
+        for index, path in enumerate(accepted_paths):
+            _emit_extraction_event(
+                event_callback,
+                "extract_start",
+                index=index,
+                path=path,
+                file_name=Path(path).name,
+            )
+            payload = _extract_single_payload(index, path, max_chars_per_pdf)
+            _emit_extraction_payload_event(event_callback, payload)
+            yield payload
+        return
+
     executor_kinds = [
         concurrent.futures.ProcessPoolExecutor,
         concurrent.futures.ThreadPoolExecutor,
     ]
+    last_error: Optional[BaseException] = None
 
     for executor_kind in executor_kinds:
         try:
             with executor_kind(max_workers=workers) as executor:
-                futures = [
-                    executor.submit(_extract_single_payload, index, path, max_chars_per_pdf)
-                    for index, path in enumerate(accepted_paths)
-                ]
+                futures = []
+                for index, path in enumerate(accepted_paths):
+                    _emit_extraction_event(
+                        event_callback,
+                        "extract_start",
+                        index=index,
+                        path=path,
+                        file_name=Path(path).name,
+                    )
+                    futures.append(
+                        executor.submit(_extract_single_payload, index, path, max_chars_per_pdf)
+                    )
                 for future in concurrent.futures.as_completed(futures):
                     payload = future.result()
-                    ordered[payload["index"]] = payload
-            break
-        except (PermissionError, OSError):
-            ordered = [None] * len(accepted_paths)
+                    _emit_extraction_payload_event(event_callback, payload)
+                    yield payload
+            return
+        except (PermissionError, OSError) as error:
+            last_error = error
             continue
 
-    return [item for item in ordered if item is not None]
+    if last_error is not None:
+        for index, path in enumerate(accepted_paths):
+            _emit_extraction_event(
+                event_callback,
+                "extract_start",
+                index=index,
+                path=path,
+                file_name=Path(path).name,
+            )
+            payload = _extract_single_payload(index, path, max_chars_per_pdf)
+            _emit_extraction_payload_event(event_callback, payload)
+            yield payload
 
 
-def _extract_single_payload(index: int, path: str, max_chars: int) -> Dict[str, str]:
+def _extract_single_payload(index: int, path: str, max_chars: int) -> ExtractedPdfPayload:
+    started_at = time.monotonic()
+    file_name = Path(path).name
     try:
         text = extract_pdf_text(path, max_chars=max_chars)
-        return {"index": index, "path": path, "text": text, "error": ""}
+        pdf_content = _limit_text(_normalize_text(text), max_chars)
+        return ExtractedPdfPayload(
+            index=index,
+            path=path,
+            file_name=file_name,
+            pdf_content=pdf_content,
+            elapsed_seconds=time.monotonic() - started_at,
+        )
     except Exception as error:
-        return {"index": index, "path": path, "text": "", "error": str(error)}
+        return ExtractedPdfPayload(
+            index=index,
+            path=path,
+            file_name=file_name,
+            pdf_content="",
+            extraction_error=str(error),
+            elapsed_seconds=time.monotonic() - started_at,
+        )
+
+
+def _emit_extraction_event(
+    callback: Optional[Callable[[str, Dict[str, Any]], None]],
+    event: str,
+    **payload: Any,
+) -> None:
+    if callback is None:
+        return
+    callback(event, payload)
+
+
+def _emit_extraction_payload_event(
+    callback: Optional[Callable[[str, Dict[str, Any]], None]],
+    payload: ExtractedPdfPayload,
+) -> None:
+    event = "extract_fail" if payload.extraction_error else "extract_success"
+    _emit_extraction_event(
+        callback,
+        event,
+        index=payload.index,
+        path=payload.path,
+        file_name=payload.file_name,
+        pdf_content=payload.pdf_content,
+        extraction_error=payload.extraction_error,
+        elapsed_seconds=payload.elapsed_seconds,
+    )
 
 
 def _compute_file_worker_limit(file_count: int) -> int:

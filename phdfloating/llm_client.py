@@ -11,6 +11,18 @@ from .prompt_builder import build_messages, parse_summary_json
 from .settings_store import ensure_api_settings, normalize_api_url, sanitize_settings
 
 
+SUMMARY_FAILURE_TEXT = "无法总结"
+
+
+def build_summary_failure_placeholder(file_name: str) -> Dict[str, Any]:
+    name = str(file_name or "PDF").strip() or "PDF"
+    return {
+        "name": name,
+        "summary": SUMMARY_FAILURE_TEXT,
+        "keywords": [],
+    }
+
+
 class OpenAICompatibleLLMClient:
     def __init__(self, settings: Dict[str, Any]):
         sanitized = sanitize_settings(settings)
@@ -29,22 +41,23 @@ class OpenAICompatibleLLMClient:
 
         results: List[Dict[str, Any]] = []
         for item in input_json_list:
-            file_name = str(item.get("file_name") or "未命名 PDF")
-            completion = self.request_chat_completion(
-                build_messages([item], summary_language=self.summary_language),
-                max_tokens=900,
-            )
-            parsed = parse_summary_json(completion)
-
-            if parsed:
-                result = parsed[0]
-                if not result.get("name"):
-                    result["name"] = file_name
-                results.append(result)
-            else:
-                results.append({"name": file_name, "summary": "模型没有返回可读总结。", "keywords": []})
-
+            results.append(self.summarize_single_input(item))
         return results
+
+    def summarize_single_input(self, item: Dict[str, str]) -> Dict[str, Any]:
+        file_name = str(item.get("file_name") or "未命名 PDF")
+        completion = self.request_chat_completion(
+            build_messages([item], summary_language=self.summary_language),
+            max_tokens=900,
+        )
+        parsed = parse_summary_json(completion)
+        if not parsed:
+            raise RuntimeError("模型没有返回可读总结。")
+
+        result = parsed[0]
+        if not result.get("name"):
+            result["name"] = file_name
+        return result
 
     def request_chat_completion(
         self,
